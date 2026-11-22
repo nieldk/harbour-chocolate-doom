@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Chocolate Doom
+Name[en]=Chocolate Doom
+Comment=Doom source port with touch controls
+Icon=harbour-chocolate-doom
+Exec=/usr/bin/harbour-chocolate-doom
+Categories=Game;ActionGame;
+X-Nemo-Application-Type=no-invoker
+
+[X-Sailjail]
+OrganizationName=dk.sec1
+ApplicationName=harbour-chocolate-doom
+Sandboxing=Disabled

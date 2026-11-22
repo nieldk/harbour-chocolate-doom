@@ -1,0 +1,504 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index aa9d0a4..e1bd41e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -84,6 +84,7 @@ set(GAME_SOURCE_FILES
+     i_sdlsound.c
+     i_sound.c           i_sound.h
+     i_timer.c           i_timer.h
++    i_touch.c           i_touch.h
+     i_video.c           i_video.h
+     i_videohr.c         i_videohr.h
+     i_winmusic.c
+diff --git a/src/i_touch.c b/src/i_touch.c
+new file mode 100644
+index 0000000..c2498a2
+--- /dev/null
++++ b/src/i_touch.c
+@@ -0,0 +1,403 @@
++//
++// Touch screen controls (virtual stick, look swipe, buttons).
++//
++// Finger positions are normalized to the window. Input is injected as
++// ordinary key and mouse events, so key rebinding keeps working.
++//
++// This program is free software; you can redistribute it and/or
++// modify it under the terms of the GNU General Public License
++// as published by the Free Software Foundation; either version 2
++// of the License, or (at your option) any later version.
++//
++
++#include <string.h>
++
++#include "SDL.h"
++
++#include "d_event.h"
++#include "doomkeys.h"
++#include "i_touch.h"
++#include "m_argv.h"
++#include "m_controls.h"
++
++#define MAX_FINGERS   10
++#define STICK_ZONE    0.40f   // stick starts left of this x
++#define STICK_DEAD    0.06f   // in window heights
++#define LOOK_GAIN     0.6f    // mouse counts per swiped pixel
++
++typedef enum
++{
++    ROLE_NONE,
++    ROLE_STICK,
++    ROLE_LOOK,
++    ROLE_BUTTON
++} role_t;
++
++typedef struct
++{
++    SDL_FingerID id;
++    role_t role;
++    int button;
++    float ax, ay;   // stick anchor
++    float x, y;     // current position
++} finger_t;
++
++typedef struct
++{
++    float cx, cy;   // centre, x in window widths, y in window heights
++    float r;        // half size in window heights
++    int *key;       // bound key variable
++    char glyph;
++    int down;
++} button_t;
++
++static button_t buttons[] =
++{
++    { 0.90f, 0.72f, 0.14f, &key_fire,          'F', 0 },
++    { 0.74f, 0.84f, 0.10f, &key_use,           'U', 0 },
++    { 0.96f, 0.46f, 0.08f, &key_nextweapon,    '>', 0 },
++    { 0.82f, 0.46f, 0.08f, &key_prevweapon,    '<', 0 },
++    { 0.46f, 0.08f, 0.07f, &key_menu_activate, 'M', 0 },
++    { 0.54f, 0.08f, 0.07f, &key_menu_forward,  'E', 0 },
++    { 0.62f, 0.08f, 0.07f, &key_menu_confirm,  'Y', 0 },
++};
++
++#define NUM_BUTTONS ((int) (sizeof(buttons) / sizeof(buttons[0])))
++
++// Stick directions: up, down, left, right.
++static int *stick_keys[4] = { &key_up, &key_down, &key_left, &key_right };
++static int stick_held[4];
++
++static finger_t fingers[MAX_FINGERS];
++static boolean enabled;
++static int out_w = 1280, out_h = 720;
++static float look_accum;
++
++// 5x7 glyphs, one row per byte, bit 4 is the left column.
++static const struct { char c; unsigned char rows[7]; } font[] =
++{
++    { 'F', { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10 } },
++    { 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e } },
++    { 'M', { 0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11 } },
++    { 'E', { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f } },
++    { '<', { 0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02 } },
++    { '>', { 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08 } },
++    { 'Y', { 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04 } },
++};
++
++static void PostKey(int type, int key)
++{
++    event_t ev;
++
++    if (key == 0)
++    {
++        return;
++    }
++
++    memset(&ev, 0, sizeof(ev));
++    ev.type = type;
++    ev.data1 = key;
++
++    if (type == ev_keydown)
++    {
++        ev.data2 = key;
++        ev.data3 = key;
++    }
++
++    D_PostEvent(&ev);
++}
++
++static void PostLook(int dx)
++{
++    event_t ev;
++
++    memset(&ev, 0, sizeof(ev));
++    ev.type = ev_mouse;
++    ev.data2 = dx;
++    D_PostEvent(&ev);
++}
++
++static finger_t *FindFinger(SDL_FingerID id)
++{
++    int i;
++
++    for (i = 0; i < MAX_FINGERS; ++i)
++    {
++        if (fingers[i].role != ROLE_NONE && fingers[i].id == id)
++        {
++            return &fingers[i];
++        }
++    }
++
++    return NULL;
++}
++
++static finger_t *NewFinger(SDL_FingerID id)
++{
++    int i;
++
++    for (i = 0; i < MAX_FINGERS; ++i)
++    {
++        if (fingers[i].role == ROLE_NONE)
++        {
++            memset(&fingers[i], 0, sizeof(fingers[i]));
++            fingers[i].id = id;
++            return &fingers[i];
++        }
++    }
++
++    return NULL;
++}
++
++static int HitButton(float x, float y)
++{
++    float aspect = (float) out_w / (float) out_h;
++    int i;
++
++    for (i = 0; i < NUM_BUTTONS; ++i)
++    {
++        float dx = (x - buttons[i].cx) * aspect;
++        float dy = y - buttons[i].cy;
++
++        if (dx > -buttons[i].r && dx < buttons[i].r
++         && dy > -buttons[i].r && dy < buttons[i].r)
++        {
++            return i;
++        }
++    }
++
++    return -1;
++}
++
++static void SetStick(int dir, int on)
++{
++    if (stick_held[dir] == on)
++    {
++        return;
++    }
++
++    stick_held[dir] = on;
++    PostKey(on ? ev_keydown : ev_keyup, *stick_keys[dir]);
++}
++
++static void UpdateStick(finger_t *f)
++{
++    float aspect = (float) out_w / (float) out_h;
++    float dx = (f->x - f->ax) * aspect;
++    float dy = f->y - f->ay;
++
++    SetStick(0, dy < -STICK_DEAD);
++    SetStick(1, dy > STICK_DEAD);
++    SetStick(2, dx < -STICK_DEAD);
++    SetStick(3, dx > STICK_DEAD);
++}
++
++static void ReleaseFinger(finger_t *f)
++{
++    int i;
++
++    if (f->role == ROLE_STICK)
++    {
++        for (i = 0; i < 4; ++i)
++        {
++            SetStick(i, 0);
++        }
++    }
++    else if (f->role == ROLE_BUTTON)
++    {
++        buttons[f->button].down = 0;
++        PostKey(ev_keyup, *buttons[f->button].key);
++    }
++
++    f->role = ROLE_NONE;
++}
++
++void I_TouchReleaseAll(void)
++{
++    int i;
++
++    for (i = 0; i < MAX_FINGERS; ++i)
++    {
++        if (fingers[i].role != ROLE_NONE)
++        {
++            ReleaseFinger(&fingers[i]);
++        }
++    }
++}
++
++void I_TouchInit(void)
++{
++    if (M_CheckParm("-notouch") > 0)
++    {
++        return;
++    }
++
++    enabled = SDL_GetNumTouchDevices() > 0 || M_CheckParm("-touch") > 0;
++
++    if (enabled)
++    {
++        // Touches are handled here, do not also synthesize mouse input.
++        SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
++    }
++}
++
++void I_TouchEvent(SDL_Event *sdlevent)
++{
++    finger_t *f;
++    float x = sdlevent->tfinger.x;
++    float y = sdlevent->tfinger.y;
++    int b;
++
++    if (!enabled)
++    {
++        return;
++    }
++
++    switch (sdlevent->type)
++    {
++        case SDL_FINGERDOWN:
++            f = NewFinger(sdlevent->tfinger.fingerId);
++            if (f == NULL)
++            {
++                break;
++            }
++
++            f->x = x;
++            f->y = y;
++            b = HitButton(x, y);
++
++            if (b >= 0)
++            {
++                f->role = ROLE_BUTTON;
++                f->button = b;
++                buttons[b].down = 1;
++                PostKey(ev_keydown, *buttons[b].key);
++            }
++            else if (x < STICK_ZONE)
++            {
++                f->role = ROLE_STICK;
++                f->ax = x;
++                f->ay = y;
++            }
++            else
++            {
++                f->role = ROLE_LOOK;
++            }
++            break;
++
++        case SDL_FINGERMOTION:
++            f = FindFinger(sdlevent->tfinger.fingerId);
++            if (f == NULL)
++            {
++                break;
++            }
++
++            f->x = x;
++            f->y = y;
++
++            if (f->role == ROLE_STICK)
++            {
++                UpdateStick(f);
++            }
++            else if (f->role == ROLE_LOOK)
++            {
++                // Keep the fractional part so slow swipes still turn.
++                look_accum += sdlevent->tfinger.dx * out_w * LOOK_GAIN;
++                if (look_accum >= 1.0f || look_accum <= -1.0f)
++                {
++                    PostLook((int) look_accum);
++                    look_accum -= (int) look_accum;
++                }
++            }
++            break;
++
++        case SDL_FINGERUP:
++            f = FindFinger(sdlevent->tfinger.fingerId);
++            if (f != NULL)
++            {
++                ReleaseFinger(f);
++            }
++            break;
++
++        default:
++            break;
++    }
++}
++
++static void DrawGlyph(SDL_Renderer *r, char c, int cx, int cy, int px)
++{
++    int g, row, col;
++
++    for (g = 0; g < (int) (sizeof(font) / sizeof(font[0])); ++g)
++    {
++        if (font[g].c != c)
++        {
++            continue;
++        }
++
++        for (row = 0; row < 7; ++row)
++        {
++            for (col = 0; col < 5; ++col)
++            {
++                if (font[g].rows[row] & (0x10 >> col))
++                {
++                    SDL_Rect p = { cx + (col - 2) * px - px / 2,
++                                   cy + (row - 3) * px - px / 2, px, px };
++                    SDL_RenderFillRect(r, &p);
++                }
++            }
++        }
++        return;
++    }
++}
++
++void I_TouchDraw(SDL_Renderer *r)
++{
++    int lw, lh, i;
++
++    if (!enabled)
++    {
++        return;
++    }
++
++    // Draw in window pixels, outside the logical (aspect corrected) size.
++    SDL_RenderGetLogicalSize(r, &lw, &lh);
++    SDL_RenderSetLogicalSize(r, 0, 0);
++    SDL_GetRendererOutputSize(r, &out_w, &out_h);
++    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
++
++    for (i = 0; i < NUM_BUTTONS; ++i)
++    {
++        int half = (int) (buttons[i].r * out_h);
++        int cx = (int) (buttons[i].cx * out_w);
++        int cy = (int) (buttons[i].cy * out_h);
++        SDL_Rect box = { cx - half, cy - half, half * 2, half * 2 };
++
++        SDL_SetRenderDrawColor(r, 255, 255, 255, buttons[i].down ? 110 : 45);
++        SDL_RenderFillRect(r, &box);
++        SDL_SetRenderDrawColor(r, 255, 255, 255, 160);
++        SDL_RenderDrawRect(r, &box);
++        DrawGlyph(r, buttons[i].glyph, cx, cy, half / 5);
++    }
++
++    for (i = 0; i < MAX_FINGERS; ++i)
++    {
++        if (fingers[i].role == ROLE_STICK)
++        {
++            int base = (int) (STICK_DEAD * 2.0f * out_h);
++            SDL_Rect a = { (int) (fingers[i].ax * out_w) - base,
++                           (int) (fingers[i].ay * out_h) - base,
++                           base * 2, base * 2 };
++            SDL_Rect k = { (int) (fingers[i].x * out_w) - base / 2,
++                           (int) (fingers[i].y * out_h) - base / 2,
++                           base, base };
++
++            SDL_SetRenderDrawColor(r, 255, 255, 255, 160);
++            SDL_RenderDrawRect(r, &a);
++            SDL_SetRenderDrawColor(r, 255, 255, 255, 110);
++            SDL_RenderFillRect(r, &k);
++        }
++    }
++
++    SDL_RenderSetLogicalSize(r, lw, lh);
++}
+diff --git a/src/i_touch.h b/src/i_touch.h
+new file mode 100644
+index 0000000..df33e0c
+--- /dev/null
++++ b/src/i_touch.h
+@@ -0,0 +1,15 @@
++//
++// Touch screen controls (virtual stick, look swipe, buttons).
++//
++
++#ifndef __I_TOUCH__
++#define __I_TOUCH__
++
++#include "SDL.h"
++
++void I_TouchInit(void);
++void I_TouchEvent(SDL_Event *sdlevent);
++void I_TouchDraw(SDL_Renderer *renderer);
++void I_TouchReleaseAll(void);
++
++#endif
+diff --git a/src/i_video.c b/src/i_video.c
+index 6ff3b80..2bcbd54 100644
+--- a/src/i_video.c
++++ b/src/i_video.c
+@@ -38,6 +38,7 @@
+ #include "i_joystick.h"
+ #include "i_system.h"
+ #include "i_timer.h"
++#include "i_touch.h"
+ #include "i_video.h"
+ #include "m_argv.h"
+ #include "m_config.h"
+@@ -362,6 +363,7 @@ static void HandleWindowEvent(SDL_WindowEvent *event)
+ 
+         case SDL_WINDOWEVENT_FOCUS_LOST:
+             window_focused = false;
++            I_TouchReleaseAll();
+             break;
+ 
+         // We want to save the user's preferred monitor to use for running the
+@@ -451,6 +453,12 @@ void I_GetEvent(void)
+                 }
+                 break;
+ 
++            case SDL_FINGERDOWN:
++            case SDL_FINGERUP:
++            case SDL_FINGERMOTION:
++                I_TouchEvent(&sdlevent);
++                break;
++
+             case SDL_QUIT:
+                 if (screensaver_mode)
+                 {
+@@ -817,6 +825,7 @@ void I_FinishUpdate (void)
+ 
+     // Draw!
+ 
++    I_TouchDraw(renderer);
+     SDL_RenderPresent(renderer);
+ 
+     // Restore background and undo the disk indicator, if it was drawn.
+@@ -1419,6 +1428,11 @@ void I_InitGraphics(void)
+     byte *doompal;
+     char *env;
+ 
++#ifdef HARBOUR_SAILFISH
++    // Match the window to the .desktop file on Sailfish OS.
++    setenv("SDL_VIDEO_WAYLAND_WMCLASS", "harbour-chocolate-doom", 0);
++#endif
++
+     // Pass through the XSCREENSAVER_WINDOW environment variable to 
+     // SDL_WINDOWID, to embed the SDL window into the Xscreensaver
+     // window.
+@@ -1504,6 +1518,8 @@ void I_InitGraphics(void)
+   
+     while (SDL_PollEvent(&dummy));
+ 
++    I_TouchInit();
++
+     initialized = true;
+ 
+     // Call I_ShutdownGraphics on quit
