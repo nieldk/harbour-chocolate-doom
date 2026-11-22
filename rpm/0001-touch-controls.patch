@@ -12,15 +12,17 @@ index aa9d0a4..e1bd41e 100644
      i_winmusic.c
 diff --git a/src/i_touch.c b/src/i_touch.c
 new file mode 100644
-index 0000000..c2498a2
+index 0000000..5e7fd9e
 --- /dev/null
 +++ b/src/i_touch.c
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,537 @@
 +//
-+// Touch screen controls (virtual stick, look swipe, buttons).
++// Touch screen controls (virtual stick, look swipe, buttons, menu mode).
 +//
 +// Finger positions are normalized to the window. Input is injected as
 +// ordinary key and mouse events, so key rebinding keeps working.
++//
++// In menus a swipe moves the cursor (with repeat) and a tap selects.
 +//
 +// This program is free software; you can redistribute it and/or
 +// modify it under the terms of the GNU General Public License
@@ -28,12 +30,15 @@ index 0000000..c2498a2
 +// of the License, or (at your option) any later version.
 +//
 +
++#include <math.h>
++#include <stdio.h>
 +#include <string.h>
 +
 +#include "SDL.h"
 +
 +#include "d_event.h"
 +#include "doomkeys.h"
++#include "doomtype.h"
 +#include "i_touch.h"
 +#include "m_argv.h"
 +#include "m_controls.h"
@@ -42,6 +47,12 @@ index 0000000..c2498a2
 +#define STICK_ZONE    0.40f   // stick starts left of this x
 +#define STICK_DEAD    0.06f   // in window heights
 +#define LOOK_GAIN     0.6f    // mouse counts per swiped pixel
++#define TAP_MS        300     // max touch time for a menu tap
++#define REPEAT_FIRST  350     // ms before menu repeat starts
++#define REPEAT_NEXT   120     // ms between menu repeats
++
++// Only Doom and Strife define this. Others stay in game mode.
++extern boolean menuactive __attribute__((weak));
 +
 +typedef enum
 +{
@@ -56,8 +67,12 @@ index 0000000..c2498a2
 +    SDL_FingerID id;
 +    role_t role;
 +    int button;
-+    float ax, ay;   // stick anchor
-+    float x, y;     // current position
++    float ax, ay;       // stick anchor
++    float x, y;         // current position
++    Uint32 t0;          // touch start time
++    Uint32 next_repeat; // menu repeat deadline
++    int navdir;         // menu direction held, -1 none
++    int pulsed;         // a menu key was sent
 +} finger_t;
 +
 +typedef struct
@@ -82,12 +97,16 @@ index 0000000..c2498a2
 +
 +#define NUM_BUTTONS ((int) (sizeof(buttons) / sizeof(buttons[0])))
 +
-+// Stick directions: up, down, left, right.
++// Directions: up, down, left, right.
 +static int *stick_keys[4] = { &key_up, &key_down, &key_left, &key_right };
++static int *menu_keys[4] =
++    { &key_menu_up, &key_menu_down, &key_menu_left, &key_menu_right };
 +static int stick_held[4];
 +
 +static finger_t fingers[MAX_FINGERS];
 +static boolean enabled;
++static boolean debug;
++static boolean was_menu;
 +static int out_w = 1280, out_h = 720;
 +static float look_accum;
 +
@@ -103,6 +122,11 @@ index 0000000..c2498a2
 +    { 'Y', { 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04 } },
 +};
 +
++static int MenuOn(void)
++{
++    return &menuactive != NULL && menuactive;
++}
++
 +static void PostKey(int type, int key)
 +{
 +    event_t ev;
@@ -110,6 +134,11 @@ index 0000000..c2498a2
 +    if (key == 0)
 +    {
 +        return;
++    }
++
++    if (debug)
++    {
++        printf("touch: key %s %d\n", type == ev_keydown ? "down" : "up", key);
 +    }
 +
 +    memset(&ev, 0, sizeof(ev));
@@ -123,6 +152,12 @@ index 0000000..c2498a2
 +    }
 +
 +    D_PostEvent(&ev);
++}
++
++static void PulseKey(int key)
++{
++    PostKey(ev_keydown, key);
++    PostKey(ev_keyup, key);
 +}
 +
 +static void PostLook(int dx)
@@ -160,6 +195,7 @@ index 0000000..c2498a2
 +        {
 +            memset(&fingers[i], 0, sizeof(fingers[i]));
 +            fingers[i].id = id;
++            fingers[i].navdir = -1;
 +            return &fingers[i];
 +        }
 +    }
@@ -210,6 +246,44 @@ index 0000000..c2498a2
 +    SetStick(3, dx > STICK_DEAD);
 +}
 +
++// Menu cursor: one key per direction change, then repeat while held.
++static void UpdateNav(finger_t *f, Uint32 now)
++{
++    float aspect = (float) out_w / (float) out_h;
++    float dx = (f->x - f->ax) * aspect;
++    float dy = f->y - f->ay;
++    int dir = -1;
++
++    if (fabsf(dx) >= STICK_DEAD || fabsf(dy) >= STICK_DEAD)
++    {
++        if (fabsf(dy) >= fabsf(dx))
++        {
++            dir = dy < 0 ? 0 : 1;
++        }
++        else
++        {
++            dir = dx < 0 ? 2 : 3;
++        }
++    }
++
++    if (dir != f->navdir)
++    {
++        f->navdir = dir;
++
++        if (dir >= 0)
++        {
++            PulseKey(*menu_keys[dir]);
++            f->pulsed = 1;
++            f->next_repeat = now + REPEAT_FIRST;
++        }
++    }
++    else if (dir >= 0 && now >= f->next_repeat)
++    {
++        PulseKey(*menu_keys[dir]);
++        f->next_repeat = now + REPEAT_NEXT;
++    }
++}
++
 +static void ReleaseFinger(finger_t *f)
 +{
 +    int i;
@@ -250,6 +324,7 @@ index 0000000..c2498a2
 +        return;
 +    }
 +
++    debug = M_CheckParm("-touchdebug") > 0;
 +    enabled = SDL_GetNumTouchDevices() > 0 || M_CheckParm("-touch") > 0;
 +
 +    if (enabled)
@@ -259,16 +334,60 @@ index 0000000..c2498a2
 +    }
 +}
 +
++// Called every tic: drop held input on menu enter/leave, run menu repeat.
++void I_TouchTick(void)
++{
++    Uint32 now;
++    int menu, i;
++
++    if (!enabled)
++    {
++        return;
++    }
++
++    menu = MenuOn();
++
++    if (menu != was_menu)
++    {
++        was_menu = menu;
++        I_TouchReleaseAll();
++        return;
++    }
++
++    if (!menu)
++    {
++        return;
++    }
++
++    now = SDL_GetTicks();
++
++    for (i = 0; i < MAX_FINGERS; ++i)
++    {
++        if (fingers[i].role == ROLE_STICK)
++        {
++            UpdateNav(&fingers[i], now);
++        }
++    }
++}
++
 +void I_TouchEvent(SDL_Event *sdlevent)
 +{
 +    finger_t *f;
 +    float x = sdlevent->tfinger.x;
 +    float y = sdlevent->tfinger.y;
++    Uint32 now = SDL_GetTicks();
 +    int b;
 +
 +    if (!enabled)
 +    {
 +        return;
++    }
++
++    if (debug)
++    {
++        printf("touch: event %d id %d x %.3f y %.3f menu %d\n",
++               (int) sdlevent->type, (int) sdlevent->tfinger.fingerId,
++               x, y, MenuOn());
 +    }
 +
 +    switch (sdlevent->type)
@@ -282,6 +401,7 @@ index 0000000..c2498a2
 +
 +            f->x = x;
 +            f->y = y;
++            f->t0 = now;
 +            b = HitButton(x, y);
 +
 +            if (b >= 0)
@@ -291,7 +411,7 @@ index 0000000..c2498a2
 +                buttons[b].down = 1;
 +                PostKey(ev_keydown, *buttons[b].key);
 +            }
-+            else if (x < STICK_ZONE)
++            else if (MenuOn() || x < STICK_ZONE)
 +            {
 +                f->role = ROLE_STICK;
 +                f->ax = x;
@@ -315,7 +435,14 @@ index 0000000..c2498a2
 +
 +            if (f->role == ROLE_STICK)
 +            {
-+                UpdateStick(f);
++                if (MenuOn())
++                {
++                    UpdateNav(f, now);
++                }
++                else
++                {
++                    UpdateStick(f);
++                }
 +            }
 +            else if (f->role == ROLE_LOOK)
 +            {
@@ -333,6 +460,13 @@ index 0000000..c2498a2
 +            f = FindFinger(sdlevent->tfinger.fingerId);
 +            if (f != NULL)
 +            {
++                // A short touch without a swipe selects in menus.
++                if (f->role == ROLE_STICK && MenuOn() && !f->pulsed
++                 && now - f->t0 < TAP_MS)
++                {
++                    PulseKey(key_menu_forward);
++                }
++
 +                ReleaseFinger(f);
 +            }
 +            break;
@@ -421,12 +555,12 @@ index 0000000..c2498a2
 +}
 diff --git a/src/i_touch.h b/src/i_touch.h
 new file mode 100644
-index 0000000..df33e0c
+index 0000000..554bef8
 --- /dev/null
 +++ b/src/i_touch.h
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,16 @@
 +//
-+// Touch screen controls (virtual stick, look swipe, buttons).
++// Touch screen controls (virtual stick, look swipe, buttons, menu mode).
 +//
 +
 +#ifndef __I_TOUCH__
@@ -436,12 +570,13 @@ index 0000000..df33e0c
 +
 +void I_TouchInit(void);
 +void I_TouchEvent(SDL_Event *sdlevent);
++void I_TouchTick(void);
 +void I_TouchDraw(SDL_Renderer *renderer);
 +void I_TouchReleaseAll(void);
 +
 +#endif
 diff --git a/src/i_video.c b/src/i_video.c
-index 6ff3b80..2bcbd54 100644
+index 6ff3b80..2551b54 100644
 --- a/src/i_video.c
 +++ b/src/i_video.c
 @@ -38,6 +38,7 @@
@@ -460,7 +595,16 @@ index 6ff3b80..2bcbd54 100644
              break;
  
          // We want to save the user's preferred monitor to use for running the
-@@ -451,6 +453,12 @@ void I_GetEvent(void)
+@@ -424,6 +426,8 @@ void I_GetEvent(void)
+ {
+     SDL_Event sdlevent;
+ 
++    I_TouchTick();
++
+     SDL_PumpEvents();
+ 
+     while (SDL_PollEvent(&sdlevent))
+@@ -451,6 +455,12 @@ void I_GetEvent(void)
                  }
                  break;
  
@@ -473,7 +617,7 @@ index 6ff3b80..2bcbd54 100644
              case SDL_QUIT:
                  if (screensaver_mode)
                  {
-@@ -817,6 +825,7 @@ void I_FinishUpdate (void)
+@@ -817,6 +827,7 @@ void I_FinishUpdate (void)
  
      // Draw!
  
@@ -481,7 +625,7 @@ index 6ff3b80..2bcbd54 100644
      SDL_RenderPresent(renderer);
  
      // Restore background and undo the disk indicator, if it was drawn.
-@@ -1419,6 +1428,11 @@ void I_InitGraphics(void)
+@@ -1419,6 +1430,11 @@ void I_InitGraphics(void)
      byte *doompal;
      char *env;
  
@@ -493,7 +637,7 @@ index 6ff3b80..2bcbd54 100644
      // Pass through the XSCREENSAVER_WINDOW environment variable to 
      // SDL_WINDOWID, to embed the SDL window into the Xscreensaver
      // window.
-@@ -1504,6 +1518,8 @@ void I_InitGraphics(void)
+@@ -1504,6 +1520,8 @@ void I_InitGraphics(void)
    
      while (SDL_PollEvent(&dummy));
  

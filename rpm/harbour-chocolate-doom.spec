@@ -1,7 +1,7 @@
 Name:       harbour-chocolate-doom
 Summary:    Chocolate Doom with touch controls
 Version:    3.1.1
-Release:    1
+Release:    2
 License:    GPLv2+ and zlib
 URL:        https://github.com/chocolate-doom/chocolate-doom
 Source0:    %{name}-%{version}.tar.bz2
@@ -13,7 +13,8 @@ BuildRequires:  pkgconfig(sdl2) >= 2.0.14
 %description
 Chocolate Doom, a Doom source port that stays true to the vanilla
 behaviour, with an on-screen touch overlay: floating stick, look swipe
-and fire, use, weapon and menu buttons.
+and fire, use, weapon and menu buttons. In menus a swipe moves the
+cursor and a tap selects.
 
 Doom data is not included. Put an IWAD (for example doom.wad,
 doom2.wad or a Freedoom IWAD) in ~/.local/share/games/doom/
@@ -78,5 +79,9 @@ done
 %{_datadir}/icons/hicolor/*/apps/%{name}.png
 
 %changelog
+* Sun Nov 22 2026 Niel - 3.1.1-2
+- Menu mode: swipe moves the cursor with repeat, tap selects
+- Add -touchdebug
+
 * Sun Nov 22 2026 Niel - 3.1.1-1
 - Initial package: Chocolate Doom 3.1.1 with touch controls
