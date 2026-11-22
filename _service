@@ -2,6 +2,6 @@
     <service name="tar_git">
         <param name="url">https://github.com/NielDK/harbour-chocolate-doom</param>
         <param name="branch">main</param>
-        <param name="revision">5f1c3f9e29e9917a69148dcba63cff78e17d3eeb</param>
+        <param name="revision">1640bf89754962c16e4061ea0d4b5b48ebb2a410</param>
     </service>
 </services>
