@@ -12,15 +12,17 @@ index aa9d0a4..e1bd41e 100644
      i_winmusic.c
 diff --git a/src/i_touch.c b/src/i_touch.c
 new file mode 100644
-index 0000000..5e7fd9e
+index 0000000..65bfb8c
 --- /dev/null
 +++ b/src/i_touch.c
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,750 @@
 +//
-+// Touch screen controls (virtual stick, look swipe, buttons, menu mode).
++// Touch screen controls (virtual stick, look swipe, buttons, menu mode)
++// and 90 degree output rotation for portrait-only windows.
 +//
-+// Finger positions are normalized to the window. Input is injected as
-+// ordinary key and mouse events, so key rebinding keeps working.
++// Finger positions are normalized to the window and mapped to the
++// (possibly rotated) drawing space. Input is injected as ordinary key
++// and mouse events, so key rebinding keeps working.
 +//
 +// In menus a swipe moves the cursor (with repeat) and a tap selects.
 +//
@@ -32,6 +34,7 @@ index 0000000..5e7fd9e
 +
 +#include <math.h>
 +#include <stdio.h>
++#include <stdlib.h>
 +#include <string.h>
 +
 +#include "SDL.h"
@@ -39,13 +42,17 @@ index 0000000..5e7fd9e
 +#include "d_event.h"
 +#include "doomkeys.h"
 +#include "doomtype.h"
++#include "i_timer.h"
 +#include "i_touch.h"
 +#include "m_argv.h"
 +#include "m_controls.h"
 +
 +#define MAX_FINGERS   10
 +#define STICK_ZONE    0.40f   // stick starts left of this x
-+#define STICK_DEAD    0.06f   // in window heights
++#define STICK_DEAD    0.06f   // in drawing heights
++#define RUN_AT        0.16f   // stick distance that holds run
++#define TURN_FULL     0.20f   // stick distance for full turn speed
++#define TURN_MAX      90.0f   // mouse counts per tic at full turn
 +#define LOOK_GAIN     0.6f    // mouse counts per swiped pixel
 +#define TAP_MS        300     // max touch time for a menu tap
 +#define REPEAT_FIRST  350     // ms before menu repeat starts
@@ -73,12 +80,13 @@ index 0000000..5e7fd9e
 +    Uint32 next_repeat; // menu repeat deadline
 +    int navdir;         // menu direction held, -1 none
 +    int pulsed;         // a menu key was sent
++    float turn;         // stick turn axis, -1 to 1
 +} finger_t;
 +
 +typedef struct
 +{
-+    float cx, cy;   // centre, x in window widths, y in window heights
-+    float r;        // half size in window heights
++    float cx, cy;   // centre as a fraction of the drawing size
++    float r;        // half size in drawing heights
 +    int *key;       // bound key variable
 +    char glyph;
 +    int down;
@@ -97,18 +105,21 @@ index 0000000..5e7fd9e
 +
 +#define NUM_BUTTONS ((int) (sizeof(buttons) / sizeof(buttons[0])))
 +
-+// Directions: up, down, left, right.
-+static int *stick_keys[4] = { &key_up, &key_down, &key_left, &key_right };
++static int *move_keys[2] = { &key_up, &key_down };
 +static int *menu_keys[4] =
 +    { &key_menu_up, &key_menu_down, &key_menu_left, &key_menu_right };
-+static int stick_held[4];
++static int move_held[2];
++static int run_held;
 +
 +static finger_t fingers[MAX_FINGERS];
 +static boolean enabled;
 +static boolean debug;
 +static boolean was_menu;
-+static int out_w = 1280, out_h = 720;
-+static float look_accum;
++static int out_w = 1280, out_h = 720;   // drawing size, after rotation
++static int rot;                         // active rotation: 0, 90 or 270
++static float swipe_pending;
++static float turn_accum;
++static int last_tic = -1;
 +
 +// 5x7 glyphs, one row per byte, bit 4 is the left column.
 +static const struct { char c; unsigned char rows[7]; } font[] =
@@ -125,6 +136,23 @@ index 0000000..5e7fd9e
 +static int MenuOn(void)
 +{
 +    return &menuactive != NULL && menuactive;
++}
++
++// Requested rotation for a portrait window: -rotate 0, 90 or 270.
++static int RotationArg(void)
++{
++    int p = M_CheckParmWithArgs("-rotate", 1);
++
++    if (p > 0)
++    {
++        return atoi(myargv[p + 1]);
++    }
++
++#ifdef HARBOUR_SAILFISH
++    return 90;
++#else
++    return 0;
++#endif
 +}
 +
 +static void PostKey(int type, int key)
@@ -160,13 +188,13 @@ index 0000000..5e7fd9e
 +    PostKey(ev_keyup, key);
 +}
 +
-+static void PostLook(int dx)
++static void PostTurn(int counts)
 +{
 +    event_t ev;
 +
 +    memset(&ev, 0, sizeof(ev));
 +    ev.type = ev_mouse;
-+    ev.data2 = dx;
++    ev.data2 = counts;
 +    D_PostEvent(&ev);
 +}
 +
@@ -203,18 +231,74 @@ index 0000000..5e7fd9e
 +    return NULL;
 +}
 +
++static float Unit(void)
++{
++    return out_w < out_h ? out_w : out_h;
++}
++
++// Window (normalized) to drawing space (normalized).
++static void ToDrawing(float xw, float yw, float *u, float *v)
++{
++    if (rot == 90)
++    {
++        *u = yw;
++        *v = 1.0f - xw;
++    }
++    else if (rot == 270)
++    {
++        *u = 1.0f - yw;
++        *v = xw;
++    }
++    else
++    {
++        *u = xw;
++        *v = yw;
++    }
++}
++
++// Drawing rectangle to window rectangle.
++static SDL_Rect ToWindow(int x, int y, int w, int h)
++{
++    int ow = rot ? out_h : out_w;
++    int oh = rot ? out_w : out_h;
++    SDL_Rect r;
++
++    if (rot == 90)
++    {
++        r.x = ow - (y + h);
++        r.y = x;
++        r.w = h;
++        r.h = w;
++    }
++    else if (rot == 270)
++    {
++        r.x = y;
++        r.y = oh - (x + w);
++        r.w = h;
++        r.h = w;
++    }
++    else
++    {
++        r.x = x;
++        r.y = y;
++        r.w = w;
++        r.h = h;
++    }
++
++    return r;
++}
++
 +static int HitButton(float x, float y)
 +{
-+    float aspect = (float) out_w / (float) out_h;
 +    int i;
 +
 +    for (i = 0; i < NUM_BUTTONS; ++i)
 +    {
-+        float dx = (x - buttons[i].cx) * aspect;
-+        float dy = y - buttons[i].cy;
++        float dx = (x - buttons[i].cx) * out_w;
++        float dy = (y - buttons[i].cy) * out_h;
++        float half = buttons[i].r * Unit();
 +
-+        if (dx > -buttons[i].r && dx < buttons[i].r
-+         && dy > -buttons[i].r && dy < buttons[i].r)
++        if (dx > -half && dx < half && dy > -half && dy < half)
 +        {
 +            return i;
 +        }
@@ -223,36 +307,65 @@ index 0000000..5e7fd9e
 +    return -1;
 +}
 +
-+static void SetStick(int dir, int on)
++// Stick offset from its anchor, in units of the short drawing side.
++static void StickDelta(finger_t *f, float *dx, float *dy)
 +{
-+    if (stick_held[dir] == on)
++    *dx = (f->x - f->ax) * out_w / Unit();
++    *dy = (f->y - f->ay) * out_h / Unit();
++}
++
++static void SetMove(int dir, int on)
++{
++    if (move_held[dir] == on)
 +    {
 +        return;
 +    }
 +
-+    stick_held[dir] = on;
-+    PostKey(on ? ev_keydown : ev_keyup, *stick_keys[dir]);
++    move_held[dir] = on;
++    PostKey(on ? ev_keydown : ev_keyup, *move_keys[dir]);
 +}
 +
++static void SetRun(int on)
++{
++    if (run_held == on || key_speed <= 0 || key_speed >= 256)
++    {
++        return;
++    }
++
++    run_held = on;
++    PostKey(on ? ev_keydown : ev_keyup, key_speed);
++}
++
++// Game: up and down are keys, left and right is an analog turn.
 +static void UpdateStick(finger_t *f)
 +{
-+    float aspect = (float) out_w / (float) out_h;
-+    float dx = (f->x - f->ax) * aspect;
-+    float dy = f->y - f->ay;
++    float dx, dy, a;
 +
-+    SetStick(0, dy < -STICK_DEAD);
-+    SetStick(1, dy > STICK_DEAD);
-+    SetStick(2, dx < -STICK_DEAD);
-+    SetStick(3, dx > STICK_DEAD);
++    StickDelta(f, &dx, &dy);
++
++    SetMove(0, dy < -STICK_DEAD);
++    SetMove(1, dy > STICK_DEAD);
++    SetRun(fabsf(dy) >= RUN_AT);
++
++    a = fabsf(dx);
++    if (a < STICK_DEAD)
++    {
++        f->turn = 0.0f;
++    }
++    else
++    {
++        a = (a - STICK_DEAD) / (TURN_FULL - STICK_DEAD);
++        f->turn = (dx < 0 ? -1.0f : 1.0f) * (a > 1.0f ? 1.0f : a);
++    }
 +}
 +
 +// Menu cursor: one key per direction change, then repeat while held.
 +static void UpdateNav(finger_t *f, Uint32 now)
 +{
-+    float aspect = (float) out_w / (float) out_h;
-+    float dx = (f->x - f->ax) * aspect;
-+    float dy = f->y - f->ay;
++    float dx, dy;
 +    int dir = -1;
++
++    StickDelta(f, &dx, &dy);
 +
 +    if (fabsf(dx) >= STICK_DEAD || fabsf(dy) >= STICK_DEAD)
 +    {
@@ -286,14 +399,12 @@ index 0000000..5e7fd9e
 +
 +static void ReleaseFinger(finger_t *f)
 +{
-+    int i;
-+
 +    if (f->role == ROLE_STICK)
 +    {
-+        for (i = 0; i < 4; ++i)
-+        {
-+            SetStick(i, 0);
-+        }
++        SetMove(0, 0);
++        SetMove(1, 0);
++        SetRun(0);
++        f->turn = 0.0f;
 +    }
 +    else if (f->role == ROLE_BUTTON)
 +    {
@@ -317,6 +428,25 @@ index 0000000..5e7fd9e
 +    }
 +}
 +
++// Call before the window is created.
++void I_TouchSetHint(void)
++{
++#ifdef SDL_HINT_QTWAYLAND_CONTENT_ORIENTATION
++    int angle = RotationArg();
++
++    // Tells the compositor how the content is drawn. It does not rotate.
++    if (angle == 90)
++    {
++        SDL_SetHint(SDL_HINT_QTWAYLAND_CONTENT_ORIENTATION, "landscape");
++    }
++    else if (angle == 270)
++    {
++        SDL_SetHint(SDL_HINT_QTWAYLAND_CONTENT_ORIENTATION,
++                    "inverted-landscape");
++    }
++#endif
++}
++
 +void I_TouchInit(void)
 +{
 +    if (M_CheckParm("-notouch") > 0)
@@ -334,11 +464,12 @@ index 0000000..5e7fd9e
 +    }
 +}
 +
-+// Called every tic: drop held input on menu enter/leave, run menu repeat.
++// Called from I_GetEvent. Menu repeat and the once per tic turn input.
 +void I_TouchTick(void)
 +{
 +    Uint32 now;
-+    int menu, i;
++    int menu, tic, i, n;
++    float turn;
 +
 +    if (!enabled)
 +    {
@@ -351,30 +482,57 @@ index 0000000..5e7fd9e
 +    {
 +        was_menu = menu;
 +        I_TouchReleaseAll();
++        swipe_pending = 0.0f;
++        turn_accum = 0.0f;
 +        return;
 +    }
 +
-+    if (!menu)
++    if (menu)
++    {
++        now = SDL_GetTicks();
++
++        for (i = 0; i < MAX_FINGERS; ++i)
++        {
++            if (fingers[i].role == ROLE_STICK)
++            {
++                UpdateNav(&fingers[i], now);
++            }
++        }
++        return;
++    }
++
++    // Mouse events replace each other within a tic, so send one per tic.
++    tic = I_GetTime();
++    if (tic == last_tic)
 +    {
 +        return;
 +    }
++    last_tic = tic;
 +
-+    now = SDL_GetTicks();
-+
++    turn = 0.0f;
 +    for (i = 0; i < MAX_FINGERS; ++i)
 +    {
 +        if (fingers[i].role == ROLE_STICK)
 +        {
-+            UpdateNav(&fingers[i], now);
++            turn += fingers[i].turn * TURN_MAX;
 +        }
++    }
++
++    turn_accum += turn + swipe_pending;
++    swipe_pending = 0.0f;
++    n = (int) turn_accum;
++    turn_accum -= n;
++
++    if (n != 0)
++    {
++        PostTurn(n);
 +    }
 +}
 +
 +void I_TouchEvent(SDL_Event *sdlevent)
 +{
 +    finger_t *f;
-+    float x = sdlevent->tfinger.x;
-+    float y = sdlevent->tfinger.y;
++    float x, y, px;
 +    Uint32 now = SDL_GetTicks();
 +    int b;
 +
@@ -383,11 +541,15 @@ index 0000000..5e7fd9e
 +        return;
 +    }
 +
++    ToDrawing(sdlevent->tfinger.x, sdlevent->tfinger.y, &x, &y);
++
 +    if (debug)
 +    {
-+        printf("touch: event %d id %d x %.3f y %.3f menu %d\n",
++        printf("touch: event %d id %d window %.3f %.3f drawing %.3f %.3f"
++               " rot %d menu %d\n",
 +               (int) sdlevent->type, (int) sdlevent->tfinger.fingerId,
-+               x, y, MenuOn());
++               sdlevent->tfinger.x, sdlevent->tfinger.y, x, y, rot,
++               MenuOn());
 +    }
 +
 +    switch (sdlevent->type)
@@ -430,6 +592,7 @@ index 0000000..5e7fd9e
 +                break;
 +            }
 +
++            px = f->x;
 +            f->x = x;
 +            f->y = y;
 +
@@ -446,13 +609,7 @@ index 0000000..5e7fd9e
 +            }
 +            else if (f->role == ROLE_LOOK)
 +            {
-+                // Keep the fractional part so slow swipes still turn.
-+                look_accum += sdlevent->tfinger.dx * out_w * LOOK_GAIN;
-+                if (look_accum >= 1.0f || look_accum <= -1.0f)
-+                {
-+                    PostLook((int) look_accum);
-+                    look_accum -= (int) look_accum;
-+                }
++                swipe_pending += (x - px) * out_w * LOOK_GAIN;
 +            }
 +            break;
 +
@@ -476,6 +633,68 @@ index 0000000..5e7fd9e
 +    }
 +}
 +
++// Final blit of the game image. Rotates it when the window is portrait.
++void I_TouchCopy(SDL_Renderer *r, SDL_Texture *texture)
++{
++    int ow, oh, lw, lh;
++    SDL_Rect dst;
++    float s;
++
++    SDL_GetRendererOutputSize(r, &ow, &oh);
++    rot = (RotationArg() == 90 || RotationArg() == 270) && ow < oh
++          ? RotationArg() : 0;
++
++    if (rot == 0)
++    {
++        out_w = ow;
++        out_h = oh;
++        SDL_RenderCopy(r, texture, NULL, NULL);
++        return;
++    }
++
++    out_w = oh;
++    out_h = ow;
++
++    // Fit the game aspect into the rotated space, then rotate around
++    // the window centre.
++    SDL_RenderGetLogicalSize(r, &lw, &lh);
++    SDL_RenderSetLogicalSize(r, 0, 0);
++
++    if (lw > 0 && lh > 0)
++    {
++        s = (float) out_w / lw;
++        if ((float) out_h / lh < s)
++        {
++            s = (float) out_h / lh;
++        }
++        dst.w = (int) (lw * s);
++        dst.h = (int) (lh * s);
++    }
++    else
++    {
++        dst.w = out_w;
++        dst.h = out_h;
++    }
++
++    dst.x = ow / 2 - dst.w / 2;
++    dst.y = oh / 2 - dst.h / 2;
++
++    SDL_RenderCopyEx(r, texture, NULL, &dst, rot, NULL, SDL_FLIP_NONE);
++    SDL_RenderSetLogicalSize(r, lw, lh);
++}
++
++static void FillRect(SDL_Renderer *r, int x, int y, int w, int h)
++{
++    SDL_Rect wr = ToWindow(x, y, w, h);
++    SDL_RenderFillRect(r, &wr);
++}
++
++static void OutlineRect(SDL_Renderer *r, int x, int y, int w, int h)
++{
++    SDL_Rect wr = ToWindow(x, y, w, h);
++    SDL_RenderDrawRect(r, &wr);
++}
++
 +static void DrawGlyph(SDL_Renderer *r, char c, int cx, int cy, int px)
 +{
 +    int g, row, col;
@@ -493,9 +712,8 @@ index 0000000..5e7fd9e
 +            {
 +                if (font[g].rows[row] & (0x10 >> col))
 +                {
-+                    SDL_Rect p = { cx + (col - 2) * px - px / 2,
-+                                   cy + (row - 3) * px - px / 2, px, px };
-+                    SDL_RenderFillRect(r, &p);
++                    FillRect(r, cx + (col - 2) * px - px / 2,
++                             cy + (row - 3) * px - px / 2, px, px);
 +                }
 +            }
 +        }
@@ -515,20 +733,18 @@ index 0000000..5e7fd9e
 +    // Draw in window pixels, outside the logical (aspect corrected) size.
 +    SDL_RenderGetLogicalSize(r, &lw, &lh);
 +    SDL_RenderSetLogicalSize(r, 0, 0);
-+    SDL_GetRendererOutputSize(r, &out_w, &out_h);
 +    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
 +
 +    for (i = 0; i < NUM_BUTTONS; ++i)
 +    {
-+        int half = (int) (buttons[i].r * out_h);
++        int half = (int) (buttons[i].r * Unit());
 +        int cx = (int) (buttons[i].cx * out_w);
 +        int cy = (int) (buttons[i].cy * out_h);
-+        SDL_Rect box = { cx - half, cy - half, half * 2, half * 2 };
 +
 +        SDL_SetRenderDrawColor(r, 255, 255, 255, buttons[i].down ? 110 : 45);
-+        SDL_RenderFillRect(r, &box);
++        FillRect(r, cx - half, cy - half, half * 2, half * 2);
 +        SDL_SetRenderDrawColor(r, 255, 255, 255, 160);
-+        SDL_RenderDrawRect(r, &box);
++        OutlineRect(r, cx - half, cy - half, half * 2, half * 2);
 +        DrawGlyph(r, buttons[i].glyph, cx, cy, half / 5);
 +    }
 +
@@ -536,18 +752,15 @@ index 0000000..5e7fd9e
 +    {
 +        if (fingers[i].role == ROLE_STICK)
 +        {
-+            int base = (int) (STICK_DEAD * 2.0f * out_h);
-+            SDL_Rect a = { (int) (fingers[i].ax * out_w) - base,
-+                           (int) (fingers[i].ay * out_h) - base,
-+                           base * 2, base * 2 };
-+            SDL_Rect k = { (int) (fingers[i].x * out_w) - base / 2,
-+                           (int) (fingers[i].y * out_h) - base / 2,
-+                           base, base };
++            int base = (int) (STICK_DEAD * 2.0f * Unit());
 +
 +            SDL_SetRenderDrawColor(r, 255, 255, 255, 160);
-+            SDL_RenderDrawRect(r, &a);
++            OutlineRect(r, (int) (fingers[i].ax * out_w) - base,
++                        (int) (fingers[i].ay * out_h) - base,
++                        base * 2, base * 2);
 +            SDL_SetRenderDrawColor(r, 255, 255, 255, 110);
-+            SDL_RenderFillRect(r, &k);
++            FillRect(r, (int) (fingers[i].x * out_w) - base / 2,
++                     (int) (fingers[i].y * out_h) - base / 2, base, base);
 +        }
 +    }
 +
@@ -555,12 +768,13 @@ index 0000000..5e7fd9e
 +}
 diff --git a/src/i_touch.h b/src/i_touch.h
 new file mode 100644
-index 0000000..554bef8
+index 0000000..4c52e8a
 --- /dev/null
 +++ b/src/i_touch.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,19 @@
 +//
-+// Touch screen controls (virtual stick, look swipe, buttons, menu mode).
++// Touch screen controls (virtual stick, look swipe, buttons, menu mode)
++// and 90 degree output rotation for portrait-only windows.
 +//
 +
 +#ifndef __I_TOUCH__
@@ -568,15 +782,17 @@ index 0000000..554bef8
 +
 +#include "SDL.h"
 +
++void I_TouchSetHint(void);
 +void I_TouchInit(void);
 +void I_TouchEvent(SDL_Event *sdlevent);
 +void I_TouchTick(void);
++void I_TouchCopy(SDL_Renderer *renderer, SDL_Texture *texture);
 +void I_TouchDraw(SDL_Renderer *renderer);
 +void I_TouchReleaseAll(void);
 +
 +#endif
 diff --git a/src/i_video.c b/src/i_video.c
-index 6ff3b80..2551b54 100644
+index 6ff3b80..4489af9 100644
 --- a/src/i_video.c
 +++ b/src/i_video.c
 @@ -38,6 +38,7 @@
@@ -604,7 +820,7 @@ index 6ff3b80..2551b54 100644
      SDL_PumpEvents();
  
      while (SDL_PollEvent(&sdlevent))
-@@ -451,6 +455,12 @@ void I_GetEvent(void)
+@@ -451,7 +455,18 @@ void I_GetEvent(void)
                  }
                  break;
  
@@ -615,9 +831,28 @@ index 6ff3b80..2551b54 100644
 +                break;
 +
              case SDL_QUIT:
++#ifdef HARBOUR_SAILFISH
++                // A window manager close must exit, there is no way to
++                // answer the quit prompt.
++                I_Quit();
++#endif
                  if (screensaver_mode)
                  {
-@@ -817,6 +827,7 @@ void I_FinishUpdate (void)
+                     I_Quit();
+@@ -806,17 +821,18 @@ void I_FinishUpdate (void)
+         // Finally, render this upscaled texture to screen using linear scaling.
+ 
+         SDL_SetRenderTarget(renderer, NULL);
+-        SDL_RenderCopy(renderer, texture_upscaled, NULL, NULL);
++        I_TouchCopy(renderer, texture_upscaled);
+     }
+     else
+     {
+         SDL_SetRenderTarget(renderer, NULL);
+-        SDL_RenderCopy(renderer, texture, NULL, NULL);
++        I_TouchCopy(renderer, texture);
+     }
+ 
  
      // Draw!
  
@@ -625,19 +860,20 @@ index 6ff3b80..2551b54 100644
      SDL_RenderPresent(renderer);
  
      // Restore background and undo the disk indicator, if it was drawn.
-@@ -1419,6 +1430,11 @@ void I_InitGraphics(void)
+@@ -1419,6 +1435,12 @@ void I_InitGraphics(void)
      byte *doompal;
      char *env;
  
 +#ifdef HARBOUR_SAILFISH
 +    // Match the window to the .desktop file on Sailfish OS.
 +    setenv("SDL_VIDEO_WAYLAND_WMCLASS", "harbour-chocolate-doom", 0);
++    I_TouchSetHint();
 +#endif
 +
      // Pass through the XSCREENSAVER_WINDOW environment variable to 
      // SDL_WINDOWID, to embed the SDL window into the Xscreensaver
      // window.
-@@ -1504,6 +1520,8 @@ void I_InitGraphics(void)
+@@ -1504,6 +1526,8 @@ void I_InitGraphics(void)
    
      while (SDL_PollEvent(&dummy));
  

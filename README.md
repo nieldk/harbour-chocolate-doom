@@ -21,5 +21,6 @@ Push, then create the OBS package with `_service` (tar_git, revision is the tag)
 
 - SDL_mixer is built static and minimal inside the spec (no Jolla package found).
 - IWAD goes in ~/.local/share/games/doom/ (no game data shipped).
-- Options: `-notouch` disables the overlay, `-touch` forces it, `-touchdebug` prints touch and key events.
+- Options: `-notouch` disables the overlay, `-touch` forces it, `-touchdebug` prints touch and key events,
+  `-rotate 270` flips the landscape direction, `-rotate 0` disables rotation.
 - The patch also applies to upstream HEAD a2dfd51.

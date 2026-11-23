@@ -1,7 +1,7 @@
 Name:       harbour-chocolate-doom
 Summary:    Chocolate Doom with touch controls
 Version:    3.1.1
-Release:    2
+Release:    3
 License:    GPLv2+ and zlib
 URL:        https://github.com/chocolate-doom/chocolate-doom
 Source0:    %{name}-%{version}.tar.bz2
@@ -79,6 +79,11 @@ done
 %{_datadir}/icons/hicolor/*/apps/%{name}.png
 
 %changelog
+* Mon Nov 23 2026 Niel - 3.1.1-3
+- Landscape: rotate output and touch on portrait-only windows
+- Analog stick turn, run on far push, one mouse event per tic
+- Window close quits immediately, no quit prompt
+
 * Sun Nov 22 2026 Niel - 3.1.1-2
 - Menu mode: swipe moves the cursor with repeat, tap selects
 - Add -touchdebug
